@@ -1,31 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-MIDOS to RIS Converter
-======================
-
-Dieses Skript konvertiert MIDOS-Datenbankeinträge (.wrk-Dateien) in das RIS-Format für den Import in 
-Referenzverwaltungssoftware wie Zotero, EndNote oder Mendeley.
-
-Merkmale:
-- Automatische Erkennung von .wrk-Dateien im aktuellen Verzeichnis
-- Intelligentes Mapping von MIDOS-Feldern in das RIS-Format
-- Spezielle Handhabung für verschiedene Dokumenttypen
-- Unterstützung für mehrere Autoren, Bearbeiter und Mitwirkende
-- Extraktion von Zusammenfassungen, Schlüsselwörtern und Seitenzahlen
-- Generierung von Links zu Volltextdokumenten
-
-Verwendung:
- python midos_to_ris.py [input_file.wrk oder Verzeichnis] [output_directory]
-    
-    Wenn keine Argumente angegeben werden, sucht das Skript nach .wrk-Dateien im aktuellen Verzeichnis.
-    
-Author: Hof Halle-Wittenberg
-Version: 1.0
-Date: 2023-07-15
-License: MIT
-"""
-
 import re
 import os
 import sys
@@ -139,9 +111,16 @@ def map_obj_link(record):
 
 def map_extra_info(record):
     """
-    Erstellt Extra-Informationen aus VERAM und OBJ (wenn URH != "j").
+    Erstellt Extra-Informationen aus INN, VERAM, OBJ (wenn URH != "j"), EXE2, EXE3, ZUN, HSS, ETI, UTI und LIE.
+    PROBLEM 3 & 4 & 7 GELÖST: Zusätzliche Felder werden in "Extras" übertragen.
+    KONSOLIDIERT: Alle Extra-Felder werden jetzt über M2 (Zotero "Extra"-Feld) übertragen.
+    ERWEITERT: INN (Interne Nachweis-Nr.) wird in M2 übertragen.
     """
     extra_parts = []
+    
+    # INN (Interne Nachweis-Nr.) hinzufügen
+    if 'INN' in record and record['INN'].strip():
+        extra_parts.append(f"INN: {record['INN'].strip()}")
     
     # VERAM Autoren formatieren
     if 'VERAM' in record and record['VERAM'].strip():
@@ -159,6 +138,40 @@ def map_extra_info(record):
             obj_file = re.sub(r'\.pdf$', '', obj_file, flags=re.IGNORECASE)
             extra_parts.append(f"OBJ: {obj_file}")
     
+    # PROBLEM 3: EXE2 (Zweitexemplar) hinzufügen
+    if 'EXE2' in record and record['EXE2'].strip():
+        extra_parts.append(f"Zweitexemplar: {record['EXE2'].strip()}")
+    
+    # PROBLEM 3: EXE3 (Drittexemplar) hinzufügen
+    if 'EXE3' in record and record['EXE3'].strip():
+        extra_parts.append(f"Drittexemplar: {record['EXE3'].strip()}")
+    
+    # PROBLEM 3: ZUN (Zusätzliche Angaben) hinzufügen
+    if 'ZUN' in record and record['ZUN'].strip():
+        extra_parts.append(f"ZUN: {record['ZUN'].strip()}")
+    
+    # PROBLEM 4: HSS (Hochschulschriftenvermerk) hinzufügen
+    if 'HSS' in record and record['HSS'].strip():
+        extra_parts.append(f"Hochschulschrift: {record['HSS'].strip()}")
+    
+    # PROBLEM 7: ETI (Ergänzender Titel) hinzufügen
+    if 'ETI' in record and record['ETI'].strip():
+        extra_parts.append(f"ETI: {record['ETI'].strip()}")
+    
+    # PROBLEM 7: UTI (Übersetzter Titel) hinzufügen  
+    if 'UTI' in record and record['UTI'].strip():
+        extra_parts.append(f"UTI: {record['UTI'].strip()}")
+    
+    # LIE (Lieferant) hinzufügen
+    if 'LIE' in record and record['LIE'].strip():
+        extra_parts.append(f"Lieferant: {record['LIE'].strip()}")
+    
+    # ISSN für Themenhefte (DTY:SW|MO + ZNA) hinzufügen
+    dty = record.get('DTY', '')
+    if ('SW' in dty or 'MO' in dty) and 'ZNA' in record and record['ZNA'].strip():
+        if 'ISSN' in record and record['ISSN'].strip():
+            extra_parts.append(f"ISSN: {record['ISSN'].strip()}")
+    
     if extra_parts:
         return ' | '.join(extra_parts)
     return None
@@ -174,7 +187,7 @@ def map_midos_to_ris(midos_record):
         'ID': ('INN', None),      # Interne Nachweis-Nr.
         'T1': map_complete_title, # Hauptsachtitel mit ZUS kombiniert
         'T2': ('ZNA', None),      # Zeitschriftentitel (oft auch für Paralleltitel PTI verwendet)
-        'T3': ('RHE', None),      # Reihe/Serien (Serientitel)
+        'T3': map_series_title,   # Reihe/Serien (Serientitel) - spezielle Behandlung für Themenhefte
         # 'A1': map_authors,      # Wird direkt behandelt
         # 'ED': map_editors,      # Wird direkt behandelt
         'A3': map_other_contributors, # Spezielle Funktion für andere Beteiligte (BET)
@@ -182,7 +195,7 @@ def map_midos_to_ris(midos_record):
         'Y1': ('ERJ', None),      # Erscheinungsjahr
         'PY': ('ERJ', None),      # Erscheinungsjahr (alternativ)
         'CN': ('SIG', None),      # Signatur als Call Number
-        'N2': map_abstracts,      # Abstract
+
         'AB': map_abstracts,      # Abstract (alternativ)
         'CY': ('ORT', None),      # Verlagsort
         'PB': ('VEL', None),      # Verlag
@@ -193,8 +206,8 @@ def map_midos_to_ris(midos_record):
         'JF': ('ZNA', None),      # Zeitschriftentitel
         'JO': ('ZNA', None),      # Zeitschriftentitel (alternativ)
         'JA': ('ZNA', None),      # Zeitschriftentitel (Abkürzung)
-        'VL': ('ZJG', None),      # Zeitschriften-Jahrgang
-        'IS': ('ZHE', None),      # Zeitschriften-Heft
+        'VL': map_volume_number,  # Zeitschriften-Jahrgang oder Reihennummer (für Bücher)
+        'IS': map_issue_or_band,  # Zeitschriften-Heft
         'SN': map_isbn_issn,      # ISBN/ISSN
         'UR': ('URL', None),      # Internet-Adresse Volltext
         'L1': map_obj_link,       # Link zu Datei/Objekt (bedingt)
@@ -203,15 +216,19 @@ def map_midos_to_ris(midos_record):
         'C2': ('KON', None),      # Konferenzvermerke
         'C4': ('MTY', None),      # Medientyp
         'C5': ('GLA', None),      # Länderangaben
-        'C6': ('BND', None),      # Bandangaben
+        'C6': map_series_number,  # Bandangaben (BND-Feld)
         'C7': ('GOR', None),      # Ortsangaben
         'C8': ('FEO', None),      # Kennung
         'AD': ('ORT', None),      # Adresse (hier Verlagsort)
         'SE': ('ESL', None),      # Erscheinungsland
-        'DA': ('ADA', None),      # Datum der letzten Änderung
+        # ADA (letzte Änderung) und EDA (Erfassungsdatum) werden nicht als Hauptdatumsfelder gemappt
+        # ERJ (Erscheinungsjahr) ist bereits korrekt als Y1/PY gemappt
         'DB': ('TDB', None),      # Teil-DB Zuordnung
-        'M1': ('LIE', None),      # Lieferant/Fremddatenbank
-        'M3': map_extra_info,     # Extra-Feld für VERAM und OBJ (wenn URH != "j")
+        # 'M1': ('LIE', None),    # Lieferant/Fremddatenbank - entfernt, da Zotero es als "Nummer der Reihe" interpretiert
+        'M2': map_extra_info,     # Extra-Feld für VERAM, OBJ, EXE2, EXE3, ZUN, HSS, ETI, UTI, LIE
+        'ST': map_short_title,    # PROBLEM 7: ETI und UTI als Kurztitel (Short Title)
+        'N2': map_abstracts,      # Abstract
+        'U1': map_university,     # PROBLEM 11: Universität aus HSS-Feld extrahieren
     }
     
     ris_entries = []
@@ -321,7 +338,19 @@ def map_document_type(record):
     """
     Mappt den MIDOS-Dokumenttyp auf RIS-Dokumenttyp.
     Erweiterte Logik für bessere Zuordnung, mit spezieller Behandlung für Sammelwerke.
+    PROBLEM 9: HSS-Feld führt automatisch zu Dokumenttyp THES (Dissertation).
+    NEUE REGEL: Wenn HSS UND ISBN vorhanden sind, wird es als BOOK behandelt.
     """
+    # NEUE LOGIK: Wenn HSS-Feld existiert, prüfe ob auch ISBN vorhanden ist
+    if 'HSS' in record and record['HSS'].strip():
+        # Wenn sowohl HSS als auch ISBN vorhanden sind, behandle als Buch
+        if ('ISBN' in record and record['ISBN'].strip()) or ('ISB' in record and record['ISB'].strip()):
+            # HSS wird dann in M3 (Extras) übertragen, Dokumenttyp bleibt BOOK
+            pass  # Weiter mit normaler DTY-Logik
+        else:
+            # Nur HSS ohne ISBN -> Dissertation
+            return 'THES'
+    
     dty = record.get('DTY', '')
     
     # Prüfe auf mehrere DTY-Werte (durch | getrennt)
@@ -345,13 +374,14 @@ def map_document_type(record):
             # Es ist ein herausgegebenes Sammelwerk
             return 'BOOK'  # Zotero verwendet BOOK für herausgegebene Bücher
     
-    # Spezialfall: Themenheft einer Zeitschrift
+    # PROBLEM 6: Spezialfall: Themenheft einer Zeitschrift
     if 'ZS' in dty_values and 'SW' in dty_values:
         # Ein Themenheft ist im Grunde eine spezielle Ausgabe einer Zeitschrift
         # Prüfe, ob es Einzelbeiträge gibt (durch VERAM oder Hinweise im ZUS)
         zus = record.get('ZUS', '')
-        if 'Themenheft' in zus or 'Einzelbeiträge' in zus:
+        if 'Themenheft' in zus or 'Einzelbeiträge' in zus or 'Einzelbeitr' in zus:
             # Themenheft mit mehreren Beiträgen -> als BOOK behandeln
+            # Dies löst das Problem, dass Zeitschriftenangaben nicht verloren gehen
             return 'BOOK'
         else:
             # Normale Zeitschriftenausgabe
@@ -365,6 +395,16 @@ def map_document_type(record):
     # Spezialfall: Forschungsbericht
     if 'FO' in dty_values:
         return 'RPRT'
+    
+    # PROBLEM 5: Bessere Behandlung für Berichte
+    # Wenn DTY "Bericht" enthält, aber es könnte auch ein Buch sein
+    if any('bericht' in dty.lower() for dty in dty_values):
+        # Prüfe, ob es eher ein Buch ist (hat ISBN, Verlag, etc.)
+        if (record.get('ISBN') or record.get('ISB') or 
+            (record.get('VEL') and record.get('ORT'))):
+            return 'BOOK'
+        else:
+            return 'RPRT'
     
     # Mapping von einzelnen MIDOS DTY auf RIS-Typen
     type_mapping = {
@@ -566,6 +606,7 @@ def map_pages(record):
     Extrahiert die Seitenangaben aus dem KOL-Feld.
     Erkennt sowohl arabische als auch römische Seitenzahlen.
     Für bessere Zotero-Kompatibilität werden komplette Seitenangaben beibehalten.
+    PROBLEM 1 GELÖST: Bei Zeitschriftenartikeln wird kein zusätzliches Komma eingefügt.
     """
     if 'KOL' in record and record['KOL'].strip():
         kol = record['KOL'].strip()
@@ -593,7 +634,8 @@ def map_pages(record):
         if roman_only_match:
             return roman_only_match.group(1)
         
-        # 3. Normale arabische Seitenangaben mit "S."
+        # 3. Normale arabische Seitenangaben mit "S." - KORRIGIERT für Zeitschriftenartikel
+        # Format: "S. 24-26" -> "24-26" (OHNE zusätzliches "S.")
         page_match = re.search(r'S\.\s*([\d\-,\s]+)', kol)
         if page_match:
             return page_match.group(1).strip()
@@ -632,6 +674,166 @@ def map_volume_info(record):
         # Weitere Bandformate können hier hinzugefügt werden
         # z.B. "Band 3", "Vol. 2", etc.
         
+    return None
+
+def map_series_number(record):
+    """
+    Extrahiert die Reihenzählung aus dem BND-Feld.
+    PROBLEM 2 GELÖST: "o. Z." (ohne Zählung) wird ersatzlos weggelassen.
+    ZURÜCKGESETZT: Nur BND-Feld, da VL wieder für Reihennummern verwendet wird.
+    """
+    if 'BND' in record and record['BND'].strip():
+        bnd = record['BND'].strip()
+        
+        # Wenn "o. Z." (ohne Zählung) steht, wird es weggelassen
+        if bnd.lower() == 'o. z.' or bnd.lower() == 'o.z.':
+            return None
+        
+        # Ansonsten wird die Bandangabe zurückgegeben
+        return bnd
+    
+    return None
+
+def map_series_title(record):
+    """
+    Mappt T3 (Serientitel) abhängig vom Dokumenttyp.
+    Spezialfall: Themenhefte (DTY:SW|MO + ZNA) -> ZNA als Serientitel
+    Standard: RHE als Serientitel
+    """
+    dty = record.get('DTY', '')
+    
+    # Spezialfall: Themenheft einer Zeitschrift (SW|MO + ZNA)
+    if ('SW' in dty or 'MO' in dty) and 'ZNA' in record and record['ZNA'].strip():
+        return record['ZNA'].strip()
+    
+    # Standard: RHE als Serientitel
+    if 'RHE' in record and record['RHE'].strip():
+        return record['RHE'].strip()
+    
+    return None
+
+def map_short_title(record):
+    """
+    Kombiniert ETI und UTI Felder zu einem Kurztitel.
+    Fallback: Wenn kein ETI oder UTI vorhanden ist, wird HST verwendet.
+    PROBLEM 7 GELÖST: ETI und UTI werden als Kurztitel übertragen.
+    ERWEITERT: HST als Fallback für Short Title wenn ETI/UTI fehlen.
+    """
+    title_parts = []
+    
+    if 'ETI' in record and record['ETI'].strip():
+        title_parts.append(record['ETI'].strip())
+    
+    if 'UTI' in record and record['UTI'].strip():
+        title_parts.append(record['UTI'].strip())
+    
+    if title_parts:
+        return ' | '.join(title_parts)
+    
+    # Fallback: Wenn kein ETI oder UTI vorhanden ist, verwende HST
+    if 'HST' in record and record['HST'].strip():
+        return record['HST'].strip()
+    
+    return None
+
+
+def map_volume_number(record):
+    """
+    Mappt VL-Feld abhängig vom Dokumenttyp:
+    - Für Zeitschriftenartikel: ZJG (Zeitschriften-Jahrgang)
+    - Für Bücher/Monographien: Reihennummer (ZHE oder BND) - nur wenn kein ZJG vorhanden
+    - Für Themenhefte (DTY:SW|MO + ZNA): ZJG (Zeitschriften-Jahrgang) falls vorhanden
+    KORRIGIERT: VL-Feld für Reihennummern bei Büchern, da C6 von Zotero nicht erkannt wird.
+    """
+    dty = record.get('DTY', '')
+    
+    # Für Zeitschriftenartikel: verwende ZJG
+    if 'ZA' in dty or 'ZS' in dty:
+        if 'ZJG' in record and record['ZJG'].strip():
+            return record['ZJG'].strip()
+    
+    # Spezialfall: Themenhefte (DTY:SW|MO + ZNA) mit ZJG verwenden ZJG als Jahrgang
+    if ('SW' in dty or 'MO' in dty) and 'ZNA' in record and record['ZNA'].strip():
+        if 'ZJG' in record and record['ZJG'].strip():
+            return record['ZJG'].strip()
+    
+    # Für Bücher/Monographien: Reihennummer nur wenn kein ZJG vorhanden
+    if 'MO' in dty or 'SW' in dty:
+        # Nur wenn kein ZJG vorhanden ist (sonst ist es ein Themenheft)
+        if not ('ZJG' in record and record['ZJG'].strip()):
+            # 1. Wenn ZHE vorhanden → ZHE als Reihennummer
+            if 'ZHE' in record and record['ZHE'].strip():
+                return record['ZHE'].strip()
+            
+            # 2. Wenn BND vorhanden → BND als Reihennummer
+            if 'BND' in record and record['BND'].strip():
+                bnd = record['BND'].strip()
+                # Wenn "o. Z." (ohne Zählung) steht, wird es weggelassen
+                if bnd.lower() == 'o. z.' or bnd.lower() == 'o.z.':
+                    return None
+                return bnd
+    
+    # Fallback für Zeitschriften ohne explizite Zuordnung
+    if 'ZJG' in record and record['ZJG'].strip():
+        return record['ZJG'].strip()
+    
+    return None
+
+def map_university(record):
+    """
+    Extrahiert die Universität aus dem HSS-Feld.
+    PROBLEM 11 GELÖST: Universität wird aus HSS-Feld extrahiert.
+    Format: "Dissertation, Universität Potsdam, 2021 u.d.T.: ..."
+    """
+    if 'HSS' in record and record['HSS'].strip():
+        hss = record['HSS'].strip()
+        
+        # Pattern für verschiedene HSS-Formate:
+        # "Dissertation, Universität Potsdam, 2021"
+        # "Dissertation, Friedrich-Schiller-Universität Jena, 2023"
+        # "Dissertation, DTMD University for Digital Technologies in Medicine and Dentistry"
+        
+        # Suche nach dem Muster: "Dissertation, [Universität], [Jahr/weitere Angaben]"
+        university_match = re.search(r'Dissertation,\s*([^,]+(?:Universität|University)[^,]*)', hss, re.IGNORECASE)
+        if university_match:
+            university = university_match.group(1).strip()
+            return university
+        
+        # Fallback: Suche nach "Universität" oder "University" im HSS-Feld
+        university_match = re.search(r'([^,]*(?:Universität|University)[^,]*)', hss, re.IGNORECASE)
+        if university_match:
+            university = university_match.group(1).strip()
+            # Entferne führende/nachfolgende Kommas und Leerzeichen
+            university = re.sub(r'^[,\s]+|[,\s]+$', '', university)
+            return university
+    
+    return None
+
+def map_issue_or_band(record):
+    """
+    Mappt IS-Feld abhängig vom Dokumenttyp:
+    - Für Zeitschriftenartikel: ZHE (Zeitschriften-Heft)
+    - Für Monographien/Sammelwerke: Keine Reihennummern (gehen ins VL-Feld)
+    - Für Buchteile: Keine Bandangaben (um Verwirrung zu vermeiden)
+    KORRIGIERT: Reihennummern für Bücher gehen ins VL-Feld, nicht IS-Feld.
+    """
+    dty = record.get('DTY', '')
+    
+    # IS-Feld nur für Zeitschriften-Hefte
+    
+    # Für Zeitschriftenartikel: verwende ZHE
+    if 'ZA' in dty or 'ZS' in dty:
+        if 'ZHE' in record and record['ZHE'].strip():
+            return record['ZHE'].strip()
+    
+    # Für Monographien/Sammelwerke: Keine Reihennummern im IS-Feld
+    # (Reihennummern gehen jetzt ins VL-Feld für bessere Zotero-Kompatibilität)
+    
+    # Für Buchteile (AM): keine Bandangaben übertragen, da sie zu Verwirrung führen
+    if 'AM' in dty:
+        return None
+    
+    # Kein Fallback für ZHE bei Büchern - das geht jetzt ins VL-Feld
     return None
 
 def map_pages_end(record):
