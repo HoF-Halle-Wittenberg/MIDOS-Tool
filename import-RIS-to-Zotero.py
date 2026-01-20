@@ -814,6 +814,480 @@ class ZoteroImporter:
         logger.error("Konnte Library-Version nicht abrufen")
         return None
 
+    def get_existing_items(self) -> List[Dict]:
+        """Alle existierenden Items aus der Zotero-Bibliothek abrufen für Duplikatsprüfung"""
+        logger.info("📚 Lade existierende Items für Duplikatsprüfung...")
+        all_items = []
+        start = 0
+        limit = 100
+        
+        while True:
+            try:
+                url = f"https://api.zotero.org/groups/{self.group_id}/items"
+                params = {
+                    "start": start,
+                    "limit": limit,
+                    "format": "json",
+                    "include": "data"
+                }
+                
+                response = self.session.get(
+                    url,
+                    headers={"Zotero-API-Key": self.api_key},
+                    params=params,
+                    timeout=60
+                )
+                
+                if response.status_code == 200:
+                    items = response.json()
+                    if not items:
+                        break
+                    
+                    # Items im vollständigen Format für besseren Vergleich speichern
+                    for item in items:
+                        data = item.get('data', {})
+                        # Vollständiges Item-Objekt für normalize_item_for_comparison
+                        full_item = {
+                            'key': data.get('key'),
+                            'title': data.get('title', ''),
+                            'DOI': data.get('DOI', ''),
+                            'ISBN': data.get('ISBN', ''),
+                            'ISSN': data.get('ISSN', ''),
+                            'creators': data.get('creators', []),
+                            'date': data.get('date', ''),
+                            'publicationTitle': data.get('publicationTitle', ''),
+                            'bookTitle': data.get('bookTitle', ''),  # Für bookSections
+                            'volume': data.get('volume', ''),
+                            'issue': data.get('issue', ''),
+                            'pages': data.get('pages', ''),
+                            'itemType': data.get('itemType', ''),
+                            'publisher': data.get('publisher', ''),
+                            'place': data.get('place', ''),
+                            'abstractNote': data.get('abstractNote', ''),
+                            'url': data.get('url', ''),
+                            'extra': data.get('extra', '')
+                        }
+                        all_items.append(full_item)
+                    
+                    start += limit
+                    if start % 500 == 0:
+                        logger.info(f"   📖 {start} Items geladen...")
+                else:
+                    logger.error(f"Fehler beim Laden existierender Items: {response.status_code}")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Fehler beim Laden existierender Items: {e}")
+                break
+        
+        logger.info(f"✅ {len(all_items)} existierende Items geladen")
+        return all_items
+
+    def normalize_item_for_comparison(self, item: Dict) -> Dict:
+        """Normalisiert ein Item für den Duplikatsvergleich
+        Konvertiert sowohl neue Upload-Items als auch existierende Zotero-Items in ein einheitliches Format"""
+        
+        # Titel normalisieren
+        title = item.get('title', '').lower().strip()
+        # Entferne häufige Variationen
+        title = title.replace('  ', ' ').replace('\n', ' ').replace('\t', ' ')
+        
+        # DOI normalisieren
+        doi = item.get('DOI', '').lower().strip()
+        if doi.startswith('doi:'):
+            doi = doi[4:]
+        if doi.startswith('http://dx.doi.org/'):
+            doi = doi[18:]
+        if doi.startswith('https://doi.org/'):
+            doi = doi[16:]
+        
+        # Creators normalisieren
+        creators = []
+        for creator in item.get('creators', []):
+            if 'lastName' in creator:
+                name = f"{creator.get('lastName', '')}, {creator.get('firstName', '')}".lower().strip()
+            else:
+                name = creator.get('name', '').lower().strip()
+            # Entferne überflüssige Leerzeichen und Kommas
+            name = name.replace('  ', ' ').strip(' ,')
+            if name:
+                creators.append(name)
+        
+        # Datum normalisieren - nur Jahr extrahieren
+        date = item.get('date', '').strip()
+        year = ''
+        if date:
+            import re
+            year_match = re.search(r'\b(19|20)\d{2}\b', date)
+            if year_match:
+                year = year_match.group()
+        
+        # Publikationstitel normalisieren
+        pub_title = item.get('publicationTitle', '').lower().strip()
+        # Auch bookTitle für bookSections berücksichtigen
+        if not pub_title:
+            pub_title = item.get('bookTitle', '').lower().strip()
+        
+        # ISBN/ISSN normalisieren
+        isbn = item.get('ISBN', '').replace('-', '').replace(' ', '').lower()
+        issn = item.get('ISSN', '').replace('-', '').replace(' ', '').lower()
+        
+        # Volume und Issue normalisieren
+        volume = item.get('volume', '').strip()
+        issue = item.get('issue', '').strip()
+        
+        # Pages normalisieren
+        pages = item.get('pages', '').strip()
+        
+        return {
+            'title': title,
+            'doi': doi,
+            'creators': creators,
+            'year': year,
+            'publicationTitle': pub_title,
+            'isbn': isbn,
+            'issn': issn,
+            'volume': volume,
+            'issue': issue,
+            'pages': pages,
+            'itemType': item.get('itemType', '')
+        }
+
+    def is_duplicate(self, new_item: Dict, existing_items: List[Dict]) -> Tuple[bool, str]:
+        """Verbesserte Duplikatserkennung mit normalisiertem Vergleich
+        Konvertiert beide Items in das gleiche Format für besseren Vergleich"""
+        
+        # Beide Items normalisieren
+        new_normalized = self.normalize_item_for_comparison(new_item)
+        
+        for existing in existing_items:
+            existing_normalized = self.normalize_item_for_comparison(existing)
+            
+            # 1. DOI-Match (stärkster Indikator)
+            if (new_normalized['doi'] and existing_normalized['doi'] and 
+                new_normalized['doi'] == existing_normalized['doi']):
+                return True, f"DOI-Match: {new_normalized['doi']}"
+            
+            # 2. ISBN-Match (für Bücher)
+            if (new_normalized['isbn'] and existing_normalized['isbn'] and 
+                new_normalized['isbn'] == existing_normalized['isbn']):
+                return True, f"ISBN-Match: {new_normalized['isbn']}"
+            
+            # 3. Exakter Titel + Jahr + mindestens ein Autor
+            if (new_normalized['title'] and existing_normalized['title'] and 
+                new_normalized['title'] == existing_normalized['title'] and
+                new_normalized['year'] and existing_normalized['year'] and
+                new_normalized['year'] == existing_normalized['year']):
+                # Prüfe Autor-Überschneidung
+                if new_normalized['creators'] and existing_normalized['creators']:
+                    common_creators = set(new_normalized['creators']) & set(existing_normalized['creators'])
+                    if common_creators:
+                        return True, f"Titel+Jahr+Autor-Match: {new_normalized['title'][:50]}..."
+            
+            # 4. Sehr ähnlicher Titel + gleiche Publikation + Jahr
+            if (new_normalized['title'] and existing_normalized['title'] and
+                new_normalized['publicationTitle'] and existing_normalized['publicationTitle'] and
+                new_normalized['publicationTitle'] == existing_normalized['publicationTitle'] and
+                new_normalized['year'] and existing_normalized['year'] and
+                new_normalized['year'] == existing_normalized['year']):
+                title_similarity = self._calculate_similarity(new_normalized['title'], existing_normalized['title'])
+                if title_similarity > 0.85:  # 85% Ähnlichkeit
+                    return True, f"Ähnlicher Titel in gleicher Publikation+Jahr: {title_similarity:.1%}"
+            
+            # 5. Zeitschriftenartikel: Titel + Publikation + Volume + Issue + Pages
+            if (new_normalized['itemType'] == 'journalArticle' and existing_normalized['itemType'] == 'journalArticle' and
+                new_normalized['title'] and existing_normalized['title'] and
+                new_normalized['publicationTitle'] and existing_normalized['publicationTitle'] and
+                new_normalized['publicationTitle'] == existing_normalized['publicationTitle']):
+                # Prüfe verschiedene Kombinationen
+                matches = []
+                
+                # Exakter Titel
+                if new_normalized['title'] == existing_normalized['title']:
+                    matches.append("title")
+                
+                # Volume + Issue
+                if (new_normalized['volume'] and existing_normalized['volume'] and
+                    new_normalized['volume'] == existing_normalized['volume'] and
+                    new_normalized['issue'] and existing_normalized['issue'] and
+                    new_normalized['issue'] == existing_normalized['issue']):
+                    matches.append("vol+issue")
+                
+                # Pages
+                if (new_normalized['pages'] and existing_normalized['pages'] and
+                    new_normalized['pages'] == existing_normalized['pages']):
+                    matches.append("pages")
+                
+                # Jahr
+                if (new_normalized['year'] and existing_normalized['year'] and
+                    new_normalized['year'] == existing_normalized['year']):
+                    matches.append("year")
+                
+                # Wenn mindestens 2 starke Indikatoren übereinstimmen
+                if len(matches) >= 2 and "title" in matches:
+                    return True, f"Journal-Match ({'+'.join(matches)}): {new_normalized['title'][:50]}..."
+            
+            # 6. Buchkapitel: Titel + Buchtitel + Jahr
+            if (new_normalized['itemType'] == 'bookSection' and existing_normalized['itemType'] == 'bookSection' and
+                new_normalized['title'] and existing_normalized['title'] and
+                new_normalized['title'] == existing_normalized['title'] and
+                new_normalized['publicationTitle'] and existing_normalized['publicationTitle'] and
+                new_normalized['publicationTitle'] == existing_normalized['publicationTitle'] and
+                new_normalized['year'] and existing_normalized['year'] and
+                new_normalized['year'] == existing_normalized['year']):
+                return True, f"Buchkapitel-Match: {new_normalized['title'][:50]}..."
+        
+        return False, ""
+
+    def _calculate_similarity(self, str1: str, str2: str) -> float:
+        """Einfache Ähnlichkeitsberechnung basierend auf gemeinsamen Wörtern"""
+        if not str1 or not str2:
+            return 0.0
+        
+        words1 = set(str1.lower().split())
+        words2 = set(str2.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        return len(intersection) / len(union) if union else 0.0
+
+    def filter_duplicates(self, items: List[Dict], existing_items: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """Filtert Duplikate aus der Item-Liste mit verbesserter Erkennung
+        Returns: (unique_items, duplicate_items)"""
+        
+        logger.info("🔍 Prüfe auf Duplikate mit verbesserter Erkennung...")
+        logger.info("🔧 Verwende normalisierte Feldvergleiche für bessere Genauigkeit...")
+        
+        unique_items = []
+        duplicate_items = []
+        
+        # Statistiken für verschiedene Match-Typen
+        match_stats = {
+            'DOI-Match': 0,
+            'ISBN-Match': 0,
+            'Titel+Jahr+Autor-Match': 0,
+            'Ähnlicher Titel in gleicher Publikation+Jahr': 0,
+            'Journal-Match': 0,
+            'Buchkapitel-Match': 0
+        }
+        
+        for i, item in enumerate(items):
+            is_dup, reason = self.is_duplicate(item, existing_items)
+            
+            if is_dup:
+                duplicate_items.append({
+                    'item': item,
+                    'reason': reason
+                })
+                
+                # Statistiken aktualisieren
+                for match_type in match_stats:
+                    if match_type in reason:
+                        match_stats[match_type] += 1
+                        break
+                
+                logger.debug(f"   🔄 Duplikat gefunden: {reason}")
+            else:
+                unique_items.append(item)
+            
+            # Progress für große Listen
+            if (i + 1) % 100 == 0:
+                logger.info(f"   📊 {i + 1}/{len(items)} Items geprüft...")
+        
+        logger.info(f"✅ Duplikatsprüfung abgeschlossen:")
+        logger.info(f"   📝 Neue Items: {len(unique_items)}")
+        logger.info(f"   🔄 Duplikate gefunden: {len(duplicate_items)}")
+        
+        # Detaillierte Match-Statistiken
+        if duplicate_items:
+            logger.info("📊 Duplikat-Typen:")
+            for match_type, count in match_stats.items():
+                if count > 0:
+                    logger.info(f"   - {match_type}: {count}")
+        
+        # Duplikate-Details loggen
+        if duplicate_items:
+            logger.info("🔄 Gefundene Duplikate (erste 10):")
+            for i, dup in enumerate(duplicate_items[:10]):
+                title = dup['item'].get('title', 'Ohne Titel')[:50]
+                logger.info(f"   {i+1}. {title}... ({dup['reason']})")
+            if len(duplicate_items) > 10:
+                logger.info(f"   ... und {len(duplicate_items) - 10} weitere")
+        
+        return unique_items, duplicate_items
+
+    def _save_duplicates_report(self, duplicates: List[Dict]):
+        """Speichert einen detaillierten Bericht über gefundene Duplikate"""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"duplicates_report_{timestamp}.txt"
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(f"DUPLIKATE-BERICHT (Verbesserte Erkennung) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 80 + "\n\n")
+                f.write("VERBESSERUNGEN:\n")
+                f.write("- Normalisierte Feldvergleiche (Titel, DOI, ISBN, Autoren)\n")
+                f.write("- Bessere Behandlung von Zeitschriftenartikeln (Volume, Issue, Pages)\n")
+                f.write("- Spezielle Erkennung für Buchkapitel\n")
+                f.write("- Robuste DOI/ISBN-Normalisierung\n")
+                f.write("- Jahresextraktion aus verschiedenen Datumsformaten\n\n")
+                f.write(f"Anzahl gefundener Duplikate: {len(duplicates)}\n\n")
+                
+                # Statistiken nach Match-Typ
+                match_types = {}
+                for dup in duplicates:
+                    reason = dup['reason']
+                    match_type = reason.split(':')[0] if ':' in reason else reason
+                    match_types[match_type] = match_types.get(match_type, 0) + 1
+                
+                f.write("DUPLIKAT-TYPEN:\n")
+                for match_type, count in sorted(match_types.items()):
+                    f.write(f"- {match_type}: {count}\n")
+                f.write("\n")
+                
+                f.write("DETAILLIERTE LISTE:\n")
+                f.write("-" * 80 + "\n")
+                
+                for i, dup in enumerate(duplicates, 1):
+                    item = dup['item']
+                    reason = dup['reason']
+                    
+                    f.write(f"\n{i}. {item.get('title', 'Ohne Titel')}\n")
+                    f.write(f"   🔍 Erkennungsgrund: {reason}\n")
+                    f.write(f"   📚 Typ: {item.get('itemType', 'unbekannt')}\n")
+                    
+                    creators = item.get('creators', [])
+                    if creators:
+                        author_names = []
+                        for c in creators[:3]:
+                            if 'lastName' in c:
+                                author_names.append(f"{c.get('lastName', '')}, {c.get('firstName', '')}")
+                            else:
+                                author_names.append(c.get('name', ''))
+                        f.write(f"   👥 Autoren: {'; '.join(author_names)}\n")
+                    
+                    if item.get('date'):
+                        f.write(f"   📅 Jahr: {item.get('date')}\n")
+                    if item.get('DOI'):
+                        f.write(f"   🔗 DOI: {item.get('DOI')}\n")
+                    if item.get('ISBN'):
+                        f.write(f"   📖 ISBN: {item.get('ISBN')}\n")
+                    if item.get('publicationTitle'):
+                        f.write(f"   📰 Publikation: {item.get('publicationTitle')}\n")
+                    if item.get('volume') or item.get('issue'):
+                        vol_issue = f"Vol. {item.get('volume', '')}" if item.get('volume') else ""
+                        if item.get('issue'):
+                            vol_issue += f", Issue {item.get('issue')}"
+                        if vol_issue:
+                            f.write(f"   📊 {vol_issue.strip(', ')}\n")
+                    if item.get('pages'):
+                        f.write(f"   📄 Seiten: {item.get('pages')}\n")
+                    
+                    f.write("\n")
+            
+            logger.info(f"📄 Detaillierter Duplikate-Bericht gespeichert: {filename}")
+        except Exception as e:
+            logger.warning(f"⚠️  Konnte Duplikate-Bericht nicht speichern: {e}")
+
+    def test_duplicate_detection(self, ris_content: str) -> Dict:
+        """Testet die Duplikatserkennung ohne Upload
+        Zeigt detaillierte Statistiken über potenzielle Duplikate"""
+        
+        logger.info("🧪 DUPLIKAT-TEST GESTARTET")
+        logger.info("=" * 50)
+        
+        # 1. RIS konvertieren
+        logger.info("🔄 Konvertiere RIS-Daten...")
+        items = self.convert_ris_with_fallback(ris_content)
+        if not items:
+            logger.error("❌ RIS-Konvertierung fehlgeschlagen")
+            return {'success': False, 'error': 'Konvertierung fehlgeschlagen'}
+        
+        logger.info(f"✅ {len(items)} Items konvertiert")
+        
+        # 2. Existierende Items laden
+        logger.info("📚 Lade existierende Items...")
+        existing_items = self.get_existing_items()
+        if not existing_items:
+            logger.warning("⚠️  Keine existierenden Items gefunden")
+            return {'success': True, 'new_items': len(items), 'duplicates': 0, 'match_rate': 0}
+        
+        logger.info(f"📖 {len(existing_items)} existierende Items geladen")
+        
+        # 3. Duplikatsprüfung
+        logger.info("🔍 Führe Duplikatsprüfung durch...")
+        unique_items, duplicate_items = self.filter_duplicates(items, existing_items)
+        
+        # 4. Detaillierte Analyse
+        total_items = len(items)
+        duplicates_found = len(duplicate_items)
+        match_rate = (duplicates_found / total_items * 100) if total_items > 0 else 0
+        
+        logger.info("=" * 50)
+        logger.info("🎯 TEST-ERGEBNISSE:")
+        logger.info(f"   📊 Gesamt Items: {total_items}")
+        logger.info(f"   🔄 Duplikate gefunden: {duplicates_found}")
+        logger.info(f"   📝 Neue Items: {len(unique_items)}")
+        logger.info(f"   🎯 Match-Rate: {match_rate:.1f}%")
+        
+        if match_rate == 100:
+            logger.info("🎉 PERFEKT! Alle Items als Duplikate erkannt!")
+        elif match_rate >= 95:
+            logger.info("✅ SEHR GUT! Fast alle Items erkannt!")
+        elif match_rate >= 80:
+            logger.info("⚠️  GUT: Meiste Items erkannt, aber Verbesserung möglich")
+        else:
+            logger.info("🚨 PROBLEMATISCH: Viele Items nicht als Duplikate erkannt")
+        
+        # 5. Beispiele für nicht erkannte Items
+        if unique_items:
+            logger.info("❓ NICHT ERKANNTE ITEMS (erste 5):")
+            for i, item in enumerate(unique_items[:5]):
+                title = item.get('title', 'Ohne Titel')[:60]
+                item_type = item.get('itemType', 'unknown')
+                logger.info(f"   {i+1}. [{item_type}] {title}...")
+                
+                # Zeige verfügbare Felder für Debugging
+                fields = []
+                if item.get('DOI'): fields.append(f"DOI: {item['DOI']}")
+                if item.get('date'): fields.append(f"Jahr: {item['date']}")
+                if item.get('creators'): fields.append(f"Autoren: {len(item['creators'])}")
+                if fields:
+                    logger.info(f"      {' | '.join(fields)}")
+        
+        logger.info("=" * 50)
+        
+        return {
+            'success': True,
+            'total_items': total_items,
+            'duplicates_found': duplicates_found,
+            'new_items': len(unique_items),
+            'match_rate': match_rate,
+            'duplicate_details': duplicate_items[:10]  # Erste 10 für Details
+        }
+
+    def test_ris_file_duplicates(self, file_path: str) -> bool:
+        """Testet Duplikatserkennung für eine RIS-Datei ohne Upload"""
+        if not os.path.exists(file_path):
+            logger.error(f"❌ Datei nicht gefunden: {file_path}")
+            return False
+        
+        logger.info(f"🧪 Teste Duplikatserkennung für: {file_path}")
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                ris_content = f.read()
+            
+            result = self.test_duplicate_detection(ris_content)
+            return result.get('success', False)
+        except Exception as e:
+            logger.error(f"❌ Fehler beim Testen: {e}")
+            return False
+
     def upload_items_batch(self, items: List[Dict], library_version: str, batch_index: int = 0) -> Tuple[bool, str, Optional[str]]:
         """Items-Batch hochladen mit detailliertem Fehlerhandling"""
         
@@ -914,8 +1388,8 @@ class ZoteroImporter:
                 self.failed_items.append(failed_item)
             return False, error_msg, None
 
-    def import_ris_to_group(self, ris_content: str, batch_size: int = 25) -> bool:
-        """Hauptfunktion für RIS-Import mit umfassendem Fehlerhandling"""
+    def import_ris_to_group(self, ris_content: str, batch_size: int = 25, check_duplicates: bool = True) -> bool:
+        """Hauptfunktion für RIS-Import mit umfassendem Fehlerhandling und Duplikatsprüfung"""
         
         # Erstelle Zeitstempel für Error-Log
         self.error_log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -937,7 +1411,7 @@ class ZoteroImporter:
             logger.warning("⚠️  Keine Log-Datei aktiv - nur Konsolen-Ausgabe")
         
         # 1. RIS-Inhalt validieren
-        logger.info("📋 Schritt 1/4: RIS-Datei validieren...")
+        logger.info("📋 Schritt 1/5: RIS-Datei validieren...")
         is_valid, validation_msg = self.validate_ris_content(ris_content)
         if not is_valid:
             logger.error(f"❌ Validierung fehlgeschlagen: {validation_msg}")
@@ -950,7 +1424,7 @@ class ZoteroImporter:
                 handler.flush()
         
         # 2. RIS zu Zotero-JSON konvertieren
-        logger.info("🔄 Schritt 2/4: RIS zu Zotero-Format konvertieren...")
+        logger.info("🔄 Schritt 2/5: RIS zu Zotero-Format konvertieren...")
         logger.info("⚡ Bei Server-Überlastung wird automatisch Fallback-Parser verwendet...")
         logger.info("📚 Sammelbände werden automatisch erkannt und korrekt verarbeitet...")
         
@@ -993,17 +1467,36 @@ class ZoteroImporter:
             if isinstance(handler, logging.FileHandler):
                 handler.flush()
         
-        # 3. Library-Version abrufen
-        logger.info("🔗 Schritt 3/4: Library-Version abrufen...")
+        # 3. Duplikatsprüfung (optional)
+        if check_duplicates:
+            logger.info("� Schritt 3/5: Duplikatsprüfung...")
+            existing_items = self.get_existing_items()
+            if existing_items is not None:
+                items, duplicates = self.filter_duplicates(items, existing_items)
+                if duplicates:
+                    logger.info(f"🔄 {len(duplicates)} Duplikate übersprungen")
+                    # Duplikate in separater Datei speichern
+                    self._save_duplicates_report(duplicates)
+                
+                if not items:
+                    logger.info("✅ Alle Items waren bereits vorhanden - nichts zu importieren")
+                    return True
+            else:
+                logger.warning("⚠️  Duplikatsprüfung fehlgeschlagen - fahre ohne Prüfung fort")
+        else:
+            logger.info("⏭️  Schritt 3/5: Duplikatsprüfung übersprungen (deaktiviert)")
+        
+        # 4. Library-Version abrufen
+        logger.info("🔗 Schritt 4/5: Library-Version abrufen...")
         library_version = self.get_library_version()
         if not library_version:
             logger.error("❌ Konnte Library-Version nicht abrufen")
             return False
         logger.info(f"✅ Library-Version: {library_version}")
         
-        # 4. Items in Batches hochladen
+        # 5. Items in Batches hochladen
         total_batches = (len(items) + batch_size - 1) // batch_size
-        logger.info("📤 Schritt 4/4: Items zu Zotero hochladen...")
+        logger.info("📤 Schritt 5/5: Items zu Zotero hochladen...")
         logger.info(f"📊 Plane Upload: {len(items)} Items in {total_batches} Batches (à {batch_size} Items)")
         logger.info("-" * 50)
         
@@ -1081,6 +1574,8 @@ class ZoteroImporter:
         logger.info(f"   ✅ Erfolgreich hochgeladen: {uploaded_count} Items")
         logger.info(f"   📚 Davon Sammelbände: {sammelbände_count}")
         logger.info(f"   ❌ Fehlgeschlagen: {failed_count} Items")
+        if check_duplicates and 'duplicates' in locals():
+            logger.info(f"   🔄 Duplikate übersprungen: {len(duplicates)} Items")
         logger.info(f"   📈 Erfolgsrate: {success_rate:.1f}%")
         logger.info(f"   ⏱️  Gesamtzeit: {total_time:.1f} Sekunden")
         logger.info(f"   🚀 Durchschnitt: {(uploaded_count / total_time):.1f} Items/Sekunde")
@@ -1142,8 +1637,8 @@ class ZoteroImporter:
         
         return failed_count == 0
 
-    def import_ris_file(self, file_path: str, batch_size: int = 25) -> bool:
-        """RIS-Datei laden und importieren"""
+    def import_ris_file(self, file_path: str, batch_size: int = 25, check_duplicates: bool = True) -> bool:
+        """RIS-Datei laden und importieren mit Duplikatsprüfung"""
         
         if not os.path.exists(file_path):
             logger.error(f"❌ Datei nicht gefunden: {file_path}")
@@ -1172,7 +1667,7 @@ class ZoteroImporter:
             logger.error("❌ Konnte Datei mit keinem Encoding lesen")
             return False
         
-        return self.import_ris_to_group(ris_content, batch_size)
+        return self.import_ris_to_group(ris_content, batch_size, check_duplicates)
 
 
 # Verwendungsbeispiel
@@ -1183,6 +1678,10 @@ def main():
     RIS_FILE = "FILENAME"
     BATCH_SIZE = 15  # Noch kleinere Batches bei Server-Problemen
     CHUNK_SIZE = 50  # RIS-Einträge pro Translation-Request
+    CHECK_DUPLICATES = True  # Duplikatsprüfung aktivieren
+    
+    # TEST-MODUS: Setze auf True um nur Duplikatserkennung zu testen
+    TEST_MODE = False  # ← Hier auf True setzen für Test ohne Upload
     
     # Importer erstellen
     importer = ZoteroImporter(GROUP_ID, API_KEY)
@@ -1192,14 +1691,39 @@ def main():
     print("🔧 Fallback-Parser ist aktiviert")
     print("⚡ Intelligenter Fallback: Nach 2 fehlgeschlagenen Chunks wird sofort auf manuellen Parser umgeschaltet")
     print("📊 Erweiterte Logging: Detaillierte Progress-Updates und Statistiken")
+    print(f"🔍 Duplikatsprüfung: {'AKTIVIERT' if CHECK_DUPLICATES else 'DEAKTIVIERT'}")
     
-    # Import ausführen
-    success = importer.import_ris_file(RIS_FILE, BATCH_SIZE)
+    if CHECK_DUPLICATES:
+        print("   - Normalisierte Feldvergleiche (Titel, DOI, ISBN, Autoren)")
+        print("   - Prüft auf DOI/ISBN-Matches")
+        print("   - Prüft auf Titel+Autor+Jahr-Matches")
+        print("   - Spezielle Behandlung für Zeitschriftenartikel und Buchkapitel")
+        print("   - Erstellt detaillierten Duplikate-Bericht")
     
-    if success:
-        print("\n🎉 Import erfolgreich abgeschlossen!")
+    if TEST_MODE:
+        print("\n🧪 TEST-MODUS AKTIVIERT")
+        print("=" * 50)
+        print("Führe nur Duplikatserkennung durch (kein Upload)")
+        print("Perfekt um zu testen ob identische Daten 100% erkannt werden")
+        print("=" * 50)
+        
+        success = importer.test_ris_file_duplicates(RIS_FILE)
+        
+        if success:
+            print("\n✅ Duplikat-Test abgeschlossen! Siehe Log für Details.")
+        else:
+            print("\n❌ Duplikat-Test fehlgeschlagen. Siehe Log für Details.")
     else:
-        print("\n❌ Import mit Fehlern beendet. Siehe Log für Details.")
+        print("\n🚀 IMPORT-MODUS")
+        print("Führe vollständigen Import durch")
+        
+        # Import ausführen
+        success = importer.import_ris_file(RIS_FILE, BATCH_SIZE, CHECK_DUPLICATES)
+        
+        if success:
+            print("\n🎉 Import erfolgreich abgeschlossen!")
+        else:
+            print("\n❌ Import mit Fehlern beendet. Siehe Log für Details.")
 
 # Script ausführen
 if __name__ == "__main__":
