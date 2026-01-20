@@ -814,7 +814,7 @@ class ZoteroImporter:
         logger.error("Konnte Library-Version nicht abrufen")
         return None
 
-    def upload_items_batch(self, items: List[Dict], library_version: str) -> Tuple[bool, str, Optional[str]]:
+    def upload_items_batch(self, items: List[Dict], library_version: str, batch_index: int = 0) -> Tuple[bool, str, Optional[str]]:
         """Items-Batch hochladen mit detailliertem Fehlerhandling"""
         
         url = f"https://api.zotero.org/groups/{self.group_id}/items"
@@ -844,6 +844,20 @@ class ZoteroImporter:
                 success_count = len(successful) + len(unchanged)
                 fail_count = len(failed)
                 
+                # Fehlgeschlagene Items speichern
+                if failed:
+                    for item_index, error_info in failed.items():
+                        try:
+                            item_idx = int(item_index)
+                            if item_idx < len(items):
+                                failed_item = items[item_idx].copy()
+                                failed_item['_error'] = error_info
+                                failed_item['_batch_index'] = batch_index
+                                failed_item['_item_index'] = item_idx
+                                self.failed_items.append(failed_item)
+                        except (ValueError, IndexError) as e:
+                            logger.warning(f"Konnte fehlgeschlagenes Item nicht zuordnen: {e}")
+                
                 message = f"✓ Batch Upload: {success_count} erfolgreich"
                 if fail_count > 0:
                     message += f", {fail_count} fehlgeschlagen"
@@ -868,15 +882,44 @@ class ZoteroImporter:
                     error_msg += f" - {error_detail}"
                 except:
                     error_msg += f" - {response.text[:200]}"
+                
+                # Bei komplettem Batch-Fehler alle Items als fehlgeschlagen markieren
+                for idx, item in enumerate(items):
+                    failed_item = item.copy()
+                    failed_item['_error'] = error_msg
+                    failed_item['_batch_index'] = batch_index
+                    failed_item['_item_index'] = idx
+                    self.failed_items.append(failed_item)
+                
                 return False, error_msg, None
                 
         except requests.exceptions.Timeout:
-            return False, "Upload Timeout - versuchen Sie kleinere Batches", None
+            error_msg = "Upload Timeout - versuchen Sie kleinere Batches"
+            # Bei Timeout alle Items als fehlgeschlagen markieren
+            for idx, item in enumerate(items):
+                failed_item = item.copy()
+                failed_item['_error'] = error_msg
+                failed_item['_batch_index'] = batch_index
+                failed_item['_item_index'] = idx
+                self.failed_items.append(failed_item)
+            return False, error_msg, None
         except Exception as e:
-            return False, f"Upload Fehler: {str(e)}", None
+            error_msg = f"Upload Fehler: {str(e)}"
+            # Bei Exception alle Items als fehlgeschlagen markieren
+            for idx, item in enumerate(items):
+                failed_item = item.copy()
+                failed_item['_error'] = error_msg
+                failed_item['_batch_index'] = batch_index
+                failed_item['_item_index'] = idx
+                self.failed_items.append(failed_item)
+            return False, error_msg, None
 
     def import_ris_to_group(self, ris_content: str, batch_size: int = 25) -> bool:
         """Hauptfunktion für RIS-Import mit umfassendem Fehlerhandling"""
+        
+        # Erstelle Zeitstempel für Error-Log
+        self.error_log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.failed_items = []  # Liste für fehlgeschlagene Items
         
         logger.info("=" * 60)
         logger.info("🚀 ZOTERO RIS IMPORT GESTARTET")
@@ -981,7 +1024,7 @@ class ZoteroImporter:
             # Batch hochladen mit Retry
             batch_success = False
             for attempt in range(3):
-                success, message, new_version = self.upload_items_batch(batch, library_version)
+                success, message, new_version = self.upload_items_batch(batch, library_version, batch_num)
                 
                 if success:
                     uploaded_count += len(batch)
@@ -1041,6 +1084,45 @@ class ZoteroImporter:
         logger.info(f"   📈 Erfolgsrate: {success_rate:.1f}%")
         logger.info(f"   ⏱️  Gesamtzeit: {total_time:.1f} Sekunden")
         logger.info(f"   🚀 Durchschnitt: {(uploaded_count / total_time):.1f} Items/Sekunde")
+        
+        # 6. Error-Log schreiben wenn es Fehler gab
+        if self.failed_items:
+            error_log_file = f"zotero_import_{self.error_log_timestamp}_errors.log"
+            try:
+                with open(error_log_file, 'w', encoding='utf-8') as error_log:
+                    error_log.write(f"Fehlerprotokoll des Zotero-Imports\n")
+                    error_log.write(f"Zeitstempel: {self.error_log_timestamp}\n")
+                    error_log.write(f"Gesamt: {len(items)} Items\n")
+                    error_log.write(f"Erfolgreich: {uploaded_count}\n")
+                    error_log.write(f"Fehlgeschlagen: {len(self.failed_items)}\n")
+                    error_log.write("=" * 80 + "\n\n")
+                    
+                    for idx, failed_item in enumerate(self.failed_items, 1):
+                        error_log.write(f"Fehlgeschlagenes Item #{idx}\n")
+                        error_log.write(f"Batch: {failed_item.get('_batch_index', 'unbekannt')}\n")
+                        error_log.write(f"Item-Index: {failed_item.get('_item_index', 'unbekannt')}\n")
+                        error_log.write(f"Fehler: {failed_item.get('_error', 'Unbekannter Fehler')}\n")
+                        error_log.write(f"Titel: {failed_item.get('title', 'Kein Titel')}\n")
+                        error_log.write(f"Item-Typ: {failed_item.get('itemType', 'unbekannt')}\n")
+                        
+                        # Creators anzeigen
+                        creators = failed_item.get('creators', [])
+                        if creators:
+                            error_log.write(f"Autoren/Herausgeber:\n")
+                            for creator in creators[:3]:  # Nur erste 3
+                                creator_name = creator.get('name') or f"{creator.get('lastName', '')}, {creator.get('firstName', '')}"
+                                creator_type = creator.get('creatorType', 'unknown')
+                                error_log.write(f"  - {creator_name} ({creator_type})\n")
+                        
+                        error_log.write("\nVollständiges Item (JSON):\n")
+                        # Entferne interne Felder für saubere Ausgabe
+                        clean_item = {k: v for k, v in failed_item.items() if not k.startswith('_')}
+                        error_log.write(json.dumps(clean_item, indent=2, ensure_ascii=False))
+                        error_log.write("\n\n" + "-" * 80 + "\n\n")
+                
+                logger.info(f"📝 Fehlerprotokoll gespeichert: {error_log_file}")
+            except Exception as e:
+                logger.error(f"❌ Konnte Fehlerprotokoll nicht schreiben: {e}")
         
         if failed_count == 0:
             logger.info("🎊 PERFEKT! Alle Items erfolgreich importiert!")

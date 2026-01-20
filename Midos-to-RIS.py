@@ -111,16 +111,14 @@ def map_obj_link(record):
 
 def map_extra_info(record):
     """
-    Erstellt Extra-Informationen aus INN, VERAM, OBJ (wenn URH != "j"), EXE2, EXE3, ZUN, HSS, ETI, UTI und LIE.
+    Erstellt Extra-Informationen aus VERAM, OBJ (wenn URH != "j"), EXE2, EXE3, ZUN, HSS, ETI, UTI und LIE.
     PROBLEM 3 & 4 & 7 GELÖST: Zusätzliche Felder werden in "Extras" übertragen.
     KONSOLIDIERT: Alle Extra-Felder werden jetzt über M2 (Zotero "Extra"-Feld) übertragen.
-    ERWEITERT: INN (Interne Nachweis-Nr.) wird in M2 übertragen.
+    HINWEIS: INN wird separat über ID-Feld gemappt, nicht hier.
     """
     extra_parts = []
     
-    # INN (Interne Nachweis-Nr.) hinzufügen
-    if 'INN' in record and record['INN'].strip():
-        extra_parts.append(f"INN: {record['INN'].strip()}")
+    # INN wird über 'ID': ('INN', None) gemappt, nicht hier!
     
     # VERAM Autoren formatieren
     if 'VERAM' in record and record['VERAM'].strip():
@@ -919,6 +917,7 @@ def map_parent_book_info(record):
 def process_midos_content(content, output_dir='.'):
     """
     Verarbeitet den MIDOS-Inhalt und erstellt RIS-Dateien.
+    Fehlgeschlagene Konvertierungen werden in einer Log-Datei gespeichert.
     """
     records = parse_midos_records(content)
     print(f"Gefundene Datensätze: {len(records)}")
@@ -926,14 +925,55 @@ def process_midos_content(content, output_dir='.'):
     # Erstelle einen einzigartigen Dateinamen basierend auf Datum und Uhrzeit
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = os.path.join(output_dir, f"midos_to_ris_{timestamp}.ris")
+    log_file = os.path.join(output_dir, f"midos_to_ris_{timestamp}_errors.log")
+    
+    # Listen für erfolgreiche und fehlgeschlagene Konvertierungen
+    successful_count = 0
+    failed_records = []
     
     with open(output_file, 'w', encoding='utf-8') as f:
         for idx, record in enumerate(records, 1):
-            ris_content = map_midos_to_ris(record)
-            f.write(ris_content + "\n")
-            print(f"Datensatz {idx} konvertiert: {record.get('HST', 'Kein Titel')[:50]}...")
+            try:
+                ris_content = map_midos_to_ris(record)
+                f.write(ris_content + "\n")
+                successful_count += 1
+                print(f"Datensatz {idx} konvertiert: {record.get('HST', 'Kein Titel')[:50]}...")
+            except Exception as e:
+                # Speichere fehlgeschlagene Konvertierung
+                failed_records.append({
+                    'index': idx,
+                    'record': record,
+                    'error': str(e)
+                })
+                print(f"FEHLER bei Datensatz {idx}: {record.get('HST', 'Kein Titel')[:50]}... - {str(e)}")
     
-    print(f"\nKonvertierung abgeschlossen. RIS-Datei gespeichert unter: {output_file}")
+    # Schreibe Log-Datei nur wenn es Fehler gab
+    if failed_records:
+        with open(log_file, 'w', encoding='utf-8') as log:
+            log.write(f"Fehlerprotokoll der MIDOS-zu-RIS-Konvertierung\n")
+            log.write(f"Zeitstempel: {timestamp}\n")
+            log.write(f"Gesamt: {len(records)} Datensätze\n")
+            log.write(f"Erfolgreich: {successful_count}\n")
+            log.write(f"Fehlgeschlagen: {len(failed_records)}\n")
+            log.write("=" * 80 + "\n\n")
+            
+            for failed in failed_records:
+                log.write(f"Datensatz #{failed['index']}\n")
+                log.write(f"Fehler: {failed['error']}\n")
+                log.write(f"Titel: {failed['record'].get('HST', 'Kein Titel')}\n")
+                log.write(f"INN: {failed['record'].get('INN', 'Keine INN')}\n")
+                log.write("\nVollständiger Datensatz:\n")
+                for key, value in failed['record'].items():
+                    log.write(f"  {key}: {value}\n")
+                log.write("\n" + "-" * 80 + "\n\n")
+        
+        print(f"\n⚠ {len(failed_records)} Datensätze konnten nicht konvertiert werden.")
+        print(f"Fehlerprotokoll gespeichert unter: {log_file}")
+    
+    print(f"\nKonvertierung abgeschlossen.")
+    print(f"Erfolgreich: {successful_count}/{len(records)} Datensätze")
+    print(f"RIS-Datei gespeichert unter: {output_file}")
+    
     return output_file
 
 # Beispiel für den direkten Aufruf
